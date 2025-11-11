@@ -817,3 +817,220 @@ Return the results in the specified schema format with loop_values containing an
 
 ---
 
+## 10. Error Handling & Debugging
+
+Промпты для анализа ошибок и проблем при выполнении задач.
+
+---
+
+### 10.1. `summarize-max-steps-reason.j2`
+
+**Назначение**: Анализирует и суммирует причину, почему цель не была достигнута в пределах максимального количества шагов. Помогает понять, что пошло не так в процессе автоматизации.
+
+**Используется в**:
+- `skyvern/forge/agent.py:4011`
+
+**Ключевые особенности**:
+- Пошаговый анализ действий
+- Идентификация пользовательских ошибок (error codes)
+- Confidence scoring для ошибок
+- Анализ скриншотов и истории действий
+
+**Возвращаемые ошибки** (если определены error_code_mapping):
+- `error_code` - код ошибки из списка пользователя
+- `reasoning` - объяснение причины ошибки
+- `confidence_float` - уверенность в ошибке (0.0-1.0)
+
+**Шаблон переменных**:
+- `{{ step_count }}` - лимит шагов
+- `{{ navigation_goal }}` - цель пользователя
+- `{{ navigation_payload }}` - данные пользователя
+- `{{ steps }}` - список шагов с результатами действий
+- `{{ error_code_mapping_str }}` (optional) - пользовательские коды ошибок
+
+**Промпт**:
+```jinja2
+User is doing the task step by step on a web page. You are here to help the user summarize the main reason why the user goal has not been achieved within the limit of {{ step_count }} steps.
+
+Make sure to ONLY return the JSON object in this format:
+{
+  "page_info": str, // Describe all useful information in the page related to the user goal.
+  "reasoning": str, // Describe the reason based on 'page_info', screenshots, user goal and action results.
+  "errors": array // List of errors matching current situation. Empty if no error descriptions suit.
+    [{
+        "error_code": str,
+        "reasoning": str,
+        "confidence_float": float
+    }]
+}
+
+User Goal: {{ navigation_goal }}
+User Details: {{ navigation_payload }}
+
+Actions Taken In Each Step:
+{% for step in steps %}Step {{ step.order }} -- {{ step.actions_result }}
+{% endfor %}
+```
+
+---
+
+## 11. Prompt Engineering & Improvement
+
+Промпты для улучшения пользовательских промптов.
+
+---
+
+### 11.1. `improve-prompt-for-ai-browser-agent.j2`
+
+**Назначение**: Улучшает пользовательские промпты для AI browser agent. Делает промпты более четкими, структурированными и эффективными для автоматизации браузера.
+
+**Используется в**:
+- `skyvern/forge/routes/prompts.py:48`
+- API endpoint: `/api/v1/prompts/improve`
+
+**Ключевые особенности**:
+- Добавляет liberal whitespace для читаемости
+- Улучшает структуру и ясность
+- Учитывает дополнительный контекст
+
+**Шаблон переменных**:
+- `{{ prompt }}` - оригинальный промпт
+- `{{ context }}` (optional) - дополнительный контекст
+
+**Промпт**:
+```jinja2
+Original prompt:
+{{ prompt }}
+
+Additional context about the user's needs:
+{{ context }}
+
+Can you improve the original prompt for an AI browser agent?
+
+Respond ONLY with valid JSON in this format:
+{
+  "improved_prompt": str
+}
+
+Ensure that the "improved_prompt" contains liberal whitespace tokens for formatting, clarity, and legibility.
+```
+
+---
+
+## 12. Полный справочник всех промптов
+
+### Task V2 System Prompts (7 промптов)
+- `task_v2.j2` - основной планировщик задач ✅ *документирован*
+- `task_v2_check_completion.j2` - проверка завершения задачи V2
+- `task_v2_generate_task_block.j2` - генерация task blocks для workflow
+- `task_v2_generate_metadata.j2` - генерация метаданных для task V2
+- `task_v2_generate_extraction_task.j2` - генерация extraction tasks
+- `task_v2_loop_task_extraction_goal.j2` - генерация loop task extraction goals
+- `task_v2_summary.j2` - суммаризация выполнения task V2
+- `task_v2_summarize-max-steps-reason.j2` - анализ max steps для V2
+
+### Action Extraction Prompts (3 промпта)
+- `extract-action.j2` - основной промпт извлечения действий ✅ *документирован*
+- `extract-action-static.j2` - статическая версия (для кеширования)
+- `extract-action-dynamic.j2` - динамическая версия
+
+### Data Extraction Prompts (4 промпта)
+- `extract-information.j2` - основной extraction промпт ✅ *документирован*
+- `extract-information-from-file-text.j2` - extraction из текста файлов
+- `data-extraction-summary.j2` - суммаризация извлеченных данных
+- `extraction_prompt_for_nat_language_loops.j2` - extraction для loop values ✅ *документирован*
+
+### Validation & Checking (6 промптов)
+- `check-user-goal.j2` - проверка достижения цели ✅ *документирован*
+- `check-user-goal-with-termination.j2` - проверка с termination логикой
+- `check-evaluation-goal.j2` - оценка критериев
+- `check-phone-number-format.j2` - валидация формата телефона
+- `check-date-format.j2` - валидация формата даты
+- `decisive-criterion-validate.j2` - валидация decisive criteria
+
+### Form & Input Handling (11 промптов)
+- `single-input-action.j2` - одиночное text input действие ✅ *документирован*
+- `single-click-action.j2` - одиночное click действие
+- `single-select-action.j2` - одиночное select действие
+- `single-upload-action.j2` - одиночное upload действие
+- `normal-select.j2` - обычный dropdown select
+- `custom-select.j2` - custom select элементы
+- `parse-input-or-select-context.j2` - парсинг контекста input/select
+- `auto-completion-potential-answers.j2` - предложение autocomplete вариантов
+- `auto-completion-choose-option.j2` - выбор из autocomplete
+- `auto-completion-tweak-value.j2` - корректировка autocomplete значений
+- `confirm-multi-selection-finish.j2` - подтверждение завершения multi-select
+- `opened-dropdown-confirm.j2` - подтверждение открытия dropdown
+
+### Visual Element Parsing (2 промпта)
+- `svg-convert.j2` - конвертация SVG в текст ✅ *документирован*
+- `css-shape-convert.j2` - конвертация CSS shapes в текст
+
+### Authentication & OTP (2 промпта)
+- `parse-otp-login.j2` - парсинг OTP из email/SMS ✅ *документирован*
+- `answer-user-detail-questions.j2` - ответы на вопросы о user details
+
+### Task & Workflow Generation (5 промптов)
+- `generate-task.j2` - генерация задач из промпта ✅ *документирован*
+- `generate-workflow-parameters.j2` - генерация workflow параметров
+- `build-workflow-from-pdf.j2` - конвертация SOP в workflow ✅ *документирован*
+- `generate_workflow_run_block_description.j2` - генерация описаний блоков
+- `conversational_ui_goal.j2` - генерация titles для conversational UI
+
+### Script Generation (4 промпта)
+- `script-generation-input-text-generatiion.j2` - генерация кода для text input
+- `script-generation-file-url-generation.j2` - генерация кода для file URL
+- `infer-action-type.j2` - определение типа действия из контекста
+- `generate-action-reasoning.j2` - генерация reasoning для действий
+
+### Error Handling & Debugging (4 промпта)
+- `summarize-max-steps-reason.j2` - анализ max steps ✅ *документирован*
+- `summarize-max-retries-reason.j2` - анализ max retries
+- `surface-user-defined-errors.j2` - идентификация пользовательских ошибок
+
+### Schema & Data Structure (2 промпта)
+- `suggest-data-schema.j2` - генерация JSON schema ✅ *документирован*
+- `evaluate-prompt.j2` - оценка и улучшение промптов
+- `improve-prompt-for-ai-browser-agent.j2` - улучшение промптов ✅ *документирован*
+
+### UI-TARS & CUA Agent (3 промпта)
+- `ui-tars-system-prompt.j2` - системный промпт UI-TARS ✅ *документирован*
+- `cua-answer-question.j2` - ответы на вопросы для CUA
+- `cua-fallback-action.j2` - fallback действия для CUA
+
+---
+
+## Итоговая статистика
+
+- **Всего промптов**: 55
+- **Детально документированных**: 15
+- **Кратко описанных в справочнике**: 40
+- **Формат**: Jinja2 templates (.j2)
+- **Расположение**: `/skyvern/forge/prompts/skyvern/`
+- **Загрузчик**: `PromptEngine` в `skyvern/forge/sdk/prompting.py`
+
+## Общие паттерны
+
+1. **Все промпты требуют JSON ответ** - строгая схема с явными типами
+2. **"Think step by step"** - используется для reasoning полей
+3. **Confidence scores** - многие промпты требуют оценку уверенности (0.0-1.0)
+4. **Переменные Jinja2** - `{{ variable }}` для подстановки значений
+5. **Условная логика** - `{% if condition %}...{% endif %}`
+6. **Strict validation** - "No text before or after JSON, no trailing commas"
+
+## Использование промптов
+
+```python
+from skyvern.forge.prompts import prompt_engine
+
+# Загрузка промпта
+prompt = prompt_engine.load_prompt("extract-action", **variables)
+
+# Отправка в LLM
+response = await llm_client.completion(prompt)
+```
+
+---
+
+**Документация завершена.** Последнее обновление: 2025-11-11
+
