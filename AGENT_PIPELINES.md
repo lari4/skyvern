@@ -839,3 +839,629 @@ Iteration 3:
 
 ---
 
+
+## PIPELINE 3: Workflow Execution
+
+**Назначение**: Оркестрация последовательного выполнения блоков workflow с передачей параметров.
+
+**Entry Point**: `WorkflowService.execute_workflow()` → `workflow/service.py`
+
+**Когда используется**:
+- Workflow созданные через YAML/JSON API
+- Многошаговые автоматизации с разными типами блоков
+- Переиспользуемые процессы
+
+### Архитектура
+
+```
+┌────────────────────────────────────────────────────────────┐
+│             WORKFLOW EXECUTION FLOW                         │
+└────────────────────────────────────────────────────────────┘
+
+Workflow Definition (YAML)
+  ├─> parameters: [param1, param2, ...]
+  └─> blocks: [block1, block2, ...]
+
+EXECUTION:
+
+1. CREATE WORKFLOW RUN
+   ├─> Status: queued
+   ├─> Initialize context with parameters
+   └─> Resolve Jinja2 templates
+
+2. FOR EACH BLOCK (sequential):
+   │
+   ├──> 3. PRE-EXECUTION
+   │    ├─> Resolve block parameters from context
+   │    ├─> Create WorkflowRunBlock (status=running)
+   │    └─> Set up block-specific requirements
+   │
+   ├──> 4. EXECUTE BLOCK (type-specific)
+   │    │
+   │    ├─> TaskBlock/NavigationBlock:
+   │    │   └─> Calls Task V1 pipeline
+   │    │
+   │    ├─> ExtractionBlock:
+   │    │   └─> Calls Data Extraction pipeline
+   │    │
+   │    ├─> ForLoopBlock:
+   │    │   ├─> Extract loop values
+   │    │   ├─> FOR value in loop_values:
+   │    │   │   └─> Recursively execute loop_blocks
+   │    │   └─> Aggregate results
+   │    │
+   │    ├─> ValidationBlock:
+   │    │   ├─> Check complete_criterion OR
+   │    │   └─> Check terminate_criterion
+   │    │
+   │    ├─> CodeBlock:
+   │    │   └─> Execute Python in sandbox
+   │    │
+   │    ├─> SendEmailBlock:
+   │    │   └─> Send via SMTP
+   │    │
+   │    ├─> DownloadToS3Block:
+   │    │   └─> Upload files to S3
+   │    │
+   │    ├─> UploadToS3Block:
+   │    │   └─> Upload to S3 from URL
+   │    │
+   │    ├─> FileParserBlock:
+   │    │   └─> Parse CSV/PDF/DOCX
+   │    │
+   │    ├─> TextPromptBlock:
+   │    │   └─> LLM text generation
+   │    │
+   │    └─> WaitBlock:
+   │        └─> Sleep(seconds)
+   │
+   ├──> 5. POST-EXECUTION
+   │    ├─> Extract output parameters
+   │    ├─> Update context with outputs
+   │    ├─> Mark block as completed/failed
+   │    └─> Save BlockResult
+   │
+   └──> 6. CONTINUE/TERMINATE
+        ├─> If block failed AND continue_on_failure=false:
+        │   └─> Stop workflow → FAILED
+        │
+        ├─> If ValidationBlock triggered terminate:
+        │   └─> Stop workflow → FAILED
+        │
+        └─> Else: Next block
+
+7. FINALIZATION
+   ├─> Mark WorkflowRun as completed/failed
+   ├─> Cleanup browser
+   └─> Execute webhooks
+```
+
+### Типы блоков и их промпты
+
+| Block Type | Calls Pipeline | Key Prompts |
+|------------|----------------|-------------|
+| TaskBlock | Task V1 | extract-action.j2, check-user-goal.j2 |
+| NavigationBlock | Task V1 | extract-action.j2 |
+| ExtractionBlock | Data Extraction | extract-information.j2 |
+| ActionBlock | Task V1 | extract-action.j2 |
+| FileDownloadBlock | Task V1 | extract-action.j2 |
+| ValidationBlock | Validation | decisive-criterion-validate.j2 |
+| ForLoopBlock | Recursive | extraction_prompt_for_nat_language_loops.j2 |
+| TextPromptBlock | LLM Direct | (user-provided prompt) |
+| CodeBlock | Python Exec | (no prompt) |
+
+### Пример Workflow
+
+```yaml
+parameters:
+  - key: product_name
+    workflow_parameter_type: string
+  - key: results
+    workflow_parameter_type: json
+
+blocks:
+  - block_type: navigation
+    label: "Search for product"
+    url: "https://amazon.com"
+    navigation_goal: "Search for {{ product_name }}"
+    
+  - block_type: extraction
+    label: "Extract price"
+    data_extraction_goal: "Get product price"
+    data_schema: {"price": {"type": "string"}}
+    output_parameter_key: "results"
+    
+  - block_type: code
+    label: "Process results"
+    code: |
+      output = {"product": product_name, "price": results["price"]}
+```
+
+### Context Parameter Passing
+
+```
+Block 1 (Extraction):
+  Output: results = {"price": "$99.99"}
+  └─> context["results"] = {"price": "$99.99"}
+
+Block 2 (Code):
+  Input: {{ results.price }}  # Jinja2 resolves to "$99.99"
+  Output: processed_data = {"final_price": 99.99}
+  └─> context["processed_data"] = {"final_price": 99.99}
+
+Block 3 (SendEmail):
+  Input: body = "Price is {{ processed_data.final_price }}"
+  └─> Sends email: "Price is 99.99"
+```
+
+---
+
+## PIPELINE 4: Action Extraction
+
+**Назначение**: Извлечение и выполнение действий из скрейпленной страницы.
+
+**Entry Point**: `agent_step()` → `agent.py:876`
+
+**Является частью**: Task V1 pipeline (вызывается каждый шаг)
+
+### Архитектура
+
+```
+┌────────────────────────────────────────────────────────────┐
+│             ACTION EXTRACTION FLOW                          │
+└────────────────────────────────────────────────────────────┘
+
+1. SCRAPE PAGE
+   ├─> scrape_website(browser_state, url)
+   ├─> Extract DOM tree
+   ├─> Parse HTML elements
+   ├─> Extract accessibility tree
+   ├─> Assign unique IDs to interactable elements
+   └─> ScrapedPage:
+       ├─ elements: List[dict] # {id, tag, text, attributes}
+       ├─ element_tree: str
+       ├─ screenshots: List[bytes]
+       └─ url: str
+
+2. BUILD PROMPT
+   ├─> Load template: extract-action.j2
+   ├─> Inject variables:
+   │   - navigation_goal
+   │   - elements (filtered, ID-tagged)
+   │   - current_url
+   │   - action_history
+   │   - navigation_payload
+   │   - screenshots (attached to LLM call)
+   └─> Full prompt string
+
+3. LLM CALL (Engine-specific)
+   │
+   ├─> IF engine == skyvern_v1:
+   │   ├─> Call LLM_API_HANDLER(prompt, screenshots)
+   │   └─> Returns: JSON string
+   │
+   ├─> IF engine == openai_cua:
+   │   ├─> _generate_cua_actions()
+   │   └─> Returns: Action objects directly
+   │
+   ├─> IF engine == anthropic_cua:
+   │   ├─> _generate_anthropic_actions()
+   │   └─> Returns: Action objects
+   │
+   └─> IF engine == ui_tars:
+       ├─> _generate_ui_tars_actions()
+       ├─> Prompt: ui-tars-system-prompt.j2
+       └─> Returns: Coordinate-based actions
+
+4. PARSE ACTIONS (for skyvern_v1)
+   ├─> parse_actions(json_response)
+   ├─> Validate JSON schema
+   ├─> Create Action objects:
+   │   - ClickAction(element_id, ...)
+   │   - InputTextAction(element_id, text, ...)
+   │   - SelectOptionAction(element_id, option, ...)
+   │   - UploadFileAction(element_id, file_url, ...)
+   │   - WaitAction()
+   │   - CompleteAction()
+   │   - TerminateAction()
+   └─> List[Action]
+
+5. EXECUTE ACTIONS (ActionHandler)
+   │
+   FOR action in actions:
+       │
+       ├──> Validate action
+       │    ├─> Check element still exists
+       │    └─> Check element is interactable
+       │
+       ├──> Execute via Playwright
+       │    ├─> ClickAction → page.click(selector)
+       │    ├─> InputTextAction → page.fill(selector, text)
+       │    ├─> SelectOptionAction → page.select_option(...)
+       │    ├─> UploadFileAction → page.set_input_files(...)
+       │    └─> WaitAction → page.wait_for_timeout(...)
+       │
+       ├──> Record result
+       │    ├─> ActionSuccess(action, ...)
+       │    └─> ActionFailure(action, exception, ...)
+       │
+       └──> Continue to next action
+
+6. RETURN RESULTS
+   └─> List[ActionResult]
+```
+
+### Action Types Detail
+
+```python
+# Основные типы действий:
+
+CLICK:           # Клик по элементу
+  - element_id
+  - download: bool  # Триггерит ли загрузку
+  - file_url: str   # Для file upload через клик
+
+INPUT_TEXT:      # Ввод текста
+  - element_id
+  - text: str
+
+SELECT_OPTION:   # Выбор из dropdown
+  - element_id
+  - option: {label, value, index}
+
+UPLOAD_FILE:     # Загрузка файла
+  - element_id
+  - file_url: str
+
+WAIT:            # Ожидание
+  - No parameters
+
+COMPLETE:        # Цель достигнута
+  - Ends task successfully
+
+TERMINATE:       # Невозможно выполнить
+  - Ends task with failure
+```
+
+### Element Selection Process
+
+```
+HTML Page:
+  <button id="abc123" class="btn">Submit</button>
+
+Scraper:
+  └─> Assigns unique ID: "skyvern_id_001"
+
+ScrapedPage.elements:
+  [{
+    "id": "skyvern_id_001",
+    "tag": "button",
+    "text": "Submit",
+    "attributes": {"class": "btn"},
+    "interactable": true
+  }]
+
+LLM Prompt:
+  "...elements from page:
+   [id=skyvern_id_001, tag=button, text=Submit]"
+
+LLM Response:
+  {"action_type": "CLICK", "id": "skyvern_id_001"}
+
+ActionHandler:
+  └─> Resolves "skyvern_id_001" → actual DOM element
+  └─> page.click(selector_for_abc123)
+```
+
+---
+
+## PIPELINE 5: Data Extraction
+
+**Назначение**: Извлечение структурированных данных из страницы согласно JSON schema.
+
+**Entry Point**: 
+- `create_extract_action()` → `agent.py`
+- `ExtractionBlock.execute()` → `workflow/models/block.py`
+
+### Архитектура
+
+```
+┌────────────────────────────────────────────────────────────┐
+│             DATA EXTRACTION FLOW                            │
+└────────────────────────────────────────────────────────────┘
+
+1. PREPARATION
+   ├─> User provides:
+   │   - data_extraction_goal: str
+   │   - extracted_information_schema: dict (JSON Schema)
+   ├─> Scrape current page
+   └─> Extract text content
+
+2. BUILD PROMPT
+   ├─> Load template: extract-information.j2
+   ├─> Variables:
+   │   - {{ data_extraction_goal }}
+   │   - {{ extracted_information_schema }}
+   │   - {{ elements }}
+   │   - {{ extracted_text }}
+   │   - {{ current_url }}
+   └─> Attach screenshots
+
+3. LLM CALL
+   ├─> LLM_API_HANDLER(prompt, screenshots)
+   └─> Returns: JSON matching schema
+
+4. VALIDATE OUTPUT
+   ├─> Check JSON validity
+   ├─> Validate against schema
+   ├─> Check required fields
+   └─> Null for missing data
+
+5. RETURN
+   └─> Extracted data (dict/list)
+```
+
+### Schema Example
+
+```json
+Input Schema:
+{
+  "products": {
+    "type": "array",
+    "items": {
+      "type": "object",
+      "properties": {
+        "name": {"type": "string"},
+        "price": {"type": "string"},
+        "rating": {"type": "number"}
+      },
+      "required": ["name", "price"]
+    }
+  }
+}
+
+LLM Output:
+{
+  "products": [
+    {"name": "iPhone 15", "price": "$999", "rating": 4.5},
+    {"name": "Samsung Galaxy", "price": "$849", "rating": null}
+  ]
+}
+```
+
+---
+
+## PIPELINE 6: OTP/Authentication
+
+**Назначение**: Автоматическое получение и ввод OTP кодов для верификации.
+
+**Entry Point**: 
+- `poll_otp_value()` → `services/otp_service.py`
+- Triggered during Task V1 execution
+
+### Архитектура
+
+```
+┌────────────────────────────────────────────────────────────┐
+│             OTP AUTHENTICATION FLOW                         │
+└────────────────────────────────────────────────────────────┘
+
+1. DETECTION
+   ├─> During action extraction
+   ├─> LLM identifies verification code field
+   └─> Returns: should_enter_verification_code=true
+
+2. POLLING (poll_otp_value)
+   │
+   ├──> Check task.totp_identifier
+   │    └─> Bitwarden TOTP key / Email address
+   │
+   ├──> IF Bitwarden TOTP:
+   │    ├─> Connect to Bitwarden
+   │    ├─> Fetch TOTP secret
+   │    └─> Generate current code
+   │
+   └──> IF Email/SMS (via totp_verification_url):
+       │
+       ├──> 3. FETCH MESSAGE
+       │    ├─> Call external OTP service
+       │    └─> Get email/SMS content
+       │
+       ├──> 4. PARSE OTP
+       │    ├─> Load prompt: parse-otp-login.j2
+       │    ├─> Variables: {{ content }}
+       │    ├─> LLM extracts:
+       │    │   - otp_type: "totp" | "magic_link"
+       │    │   - otp_value: str
+       │    └─> Returns OTP code/link
+       │
+       └──> 5. RETURN CODE
+            └─> otp_value: str
+
+6. INPUT CODE
+   ├─> Create INPUT_TEXT action
+   ├─> Fill verification code field
+   └─> Continue task execution
+```
+
+### OTP Sources
+
+1. **Bitwarden TOTP**
+   - Stored TOTP secrets
+   - Real-time code generation
+   - No external API needed
+
+2. **Email Polling**
+   - External service (totp_verification_url)
+   - Periodically checks inbox
+   - Extracts code via parse-otp-login.j2
+
+3. **Magic Links**
+   - Extracted from email
+   - Opens link in browser
+   - Continues navigation
+
+### Example Flow
+
+```
+Task: Login to gmail.com
+
+Step 1: Enter email → Next
+Step 2: Enter password → Next
+Step 3: 
+  ├─> Page shows "Enter verification code"
+  ├─> LLM detects verification_code field
+  └─> should_enter_verification_code=true
+
+OTP Pipeline Triggered:
+  ├─> Check totp_identifier="user@example.com"
+  ├─> Poll external service for email
+  ├─> Receive email: "Your code is 123456"
+  ├─> parse-otp-login prompt → otp_value="123456"
+  └─> Return code
+
+Step 3 (continued):
+  ├─> INPUT_TEXT(verification_field, "123456")
+  └─> CLICK(verify_button)
+
+Step 4:
+  ├─> Login successful
+  └─> COMPLETE
+```
+
+---
+
+## PIPELINE 7: Script Generation
+
+**Назначение**: Генерация Python скриптов для повторяемых действий.
+
+**Entry Point**: 
+- `script_generation/real_skyvern_page_ai.py`
+- API: `/api/v1/scripts`
+
+### Промпты для генерации
+
+1. **`single-input-action.j2`**
+   - Генерирует INPUT_TEXT действие
+   - Определяет поле и контекст
+
+2. **`script-generation-input-text-generatiion.j2`**
+   - Генерирует код для text input
+
+3. **`script-generation-file-url-generation.j2`**
+   - Генерирует код для file upload
+
+4. **`infer-action-type.j2`**
+   - Определяет тип действия из контекста
+
+5. **`generate-action-reasoning.j2`**
+   - Генерирует комментарии/reasoning
+
+### Output Example
+
+```python
+# Generated Script
+from skyvern import Skyvern
+
+async def run():
+    skyvern = Skyvern()
+    
+    # Navigate to login page
+    await skyvern.goto("https://example.com/login")
+    
+    # Fill email field
+    await skyvern.input_text("#email", "user@example.com")
+    
+    # Fill password field
+    await skyvern.input_text("#password", "********")
+    
+    # Click login button
+    await skyvern.click("#login-btn")
+    
+    # Extract user data
+    data = await skyvern.extract({
+        "name": "string",
+        "email": "string"
+    })
+    
+    return data
+```
+
+---
+
+## Сводная таблица пайплайнов
+
+| Pipeline | Entry Point | Max Iterations | Key Prompts | Output |
+|----------|-------------|----------------|-------------|--------|
+| **Task V1** | execute_step() | 10-20 steps | extract-action, check-user-goal | Step completion |
+| **Task V2** | run_task_v2() | 50 iterations | task_v2, task_v2_generate_* | Workflow |
+| **Workflow** | execute_workflow() | N blocks | (block-specific) | Workflow results |
+| **Action Extraction** | agent_step() | 1 call/step | extract-action | List[Action] |
+| **Data Extraction** | create_extract_action() | 1 call | extract-information | Extracted dict |
+| **OTP** | poll_otp_value() | Polling | parse-otp-login | OTP code |
+| **Script Gen** | generate_script() | - | script-generation-* | Python code |
+
+---
+
+## Общие паттерны
+
+### 1. Scraping Pattern
+```
+Все пайплайны используют:
+  scrape_website() → ScrapedPage
+  └─> elements + screenshots + text
+```
+
+### 2. LLM Call Pattern
+```
+Build prompt → LLM_API_HANDLER() → Parse JSON → Execute
+```
+
+### 3. Context Passing
+```
+Workflow Context (Jinja2)
+  ├─> Parameters
+  ├─> Block outputs
+  └─> Template resolution
+```
+
+### 4. Error Handling
+```
+Try block execution
+  ├─> Success → Continue
+  ├─> Failure + continue_on_failure=true → Continue
+  └─> Failure + continue_on_failure=false → Stop
+```
+
+### 5. Browser State
+```
+BrowserState (persistent)
+  ├─> Managed by BrowserManager
+  ├─> Reused across steps/blocks
+  └─> Closed on completion
+```
+
+---
+
+## Рекомендации по выбору пайплайна
+
+**Используйте Task V1 если**:
+- Последовательность действий известна
+- Простая навигация + extraction
+- Нужна скорость выполнения
+
+**Используйте Task V2 если**:
+- Сложная задача требует планирования
+- Неизвестная последовательность действий
+- Нужна адаптивность к изменениям
+
+**Используйте Workflow если**:
+- Многошаговый процесс
+- Нужна переиспользуемость
+- Комбинация разных типов блоков
+- Передача параметров между шагами
+
+---
+
+**Документация завершена.** Дата: 2025-11-11
+
