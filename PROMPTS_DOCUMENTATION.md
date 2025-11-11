@@ -595,3 +595,225 @@ Return ONLY a valid JSON object.
 
 ---
 
+## 8. Task Generation & Schema Creation
+
+Промпты для автоматической генерации задач и JSON-схем из пользовательских запросов.
+
+---
+
+### 8.1. `generate-task.j2`
+
+**Назначение**: Генерирует определение задачи (task) из текстового промпта пользователя. Автоматически определяет URL, цели навигации и извлечения данных, создавая структурированную задачу для агента.
+
+**Используется в**:
+- `skyvern/services/task_v1_service.py:48`
+
+**Поля task schema**:
+- `url` (required) - стартовый URL (только HTTPS)
+- `suggested_title` (required) - короткое название задачи
+- `navigation_goal_reasoning` (required) - объяснение необходимости navigation
+- `is_navigation_goal_required` (required) - нужна ли навигация
+- `navigation_goal` (optional) - цель навигации с критериями завершения ("COMPLETE when...")
+- `data_extraction_reasoning` (required) - объяснение необходимости extraction
+- `require_extraction` (required) - нужно ли извлечение данных
+- `data_extraction_goal` (optional) - цель извлечения данных
+- `navigation_payload` (optional) - JSON с данными для заполнения форм
+
+**Ключевые требования**:
+- Минимум одна цель (navigation_goal или data_extraction_goal) обязательна
+- Фразы типа "find", "show me", "search" указывают на extraction
+- navigation_goal должен включать explicit completion criteria
+
+**Шаблон переменных**:
+- `{{ user_prompt }}` - запрос пользователя
+
+**Промпт** (сокращенная версия):
+```jinja2
+We are building an AI agent that can automate browser tasks. The task creation schema is a JSON object with the following fields:
+
+url: str. Required. Starting URL for the task (HTTPS only).
+suggested_title: str. Required. Short title describing the task.
+navigation_goal_reasoning: str. Required. Why navigation goal is needed.
+is_navigation_goal_required: bool. Required. Whether navigation goal is required.
+navigation_goal: str. Optional. Actions needed to achieve task. Must include completion criteria: "COMPLETE when...".
+data_extraction_reasoning: str. Required. Think step by step. Should any information be extracted?
+require_extraction: bool. Required. Is data extraction required?
+data_extraction_goal: str. Optional. Goal in terms of extracting data.
+navigation_payload: json. Optional. Information to complete task (form values, parameters).
+
+At least one of navigation_goal or data_extraction_goal should be provided.
+
+Respond with only JSON output for:
+{{ user_prompt }}
+```
+
+---
+
+### 8.2. `suggest-data-schema.j2`
+
+**Назначение**: Генерирует JSON-схему для извлечения данных на основе пользовательского запроса. Автоматически создает структуру данных, которую должен вернуть агент при extraction.
+
+**Используется в**:
+- `skyvern/forge/agent_protocol.py:2457`
+
+**Ключевые особенности**:
+- Использует дополнительный контекст (data_extraction_goal, existing_schema)
+- Генерирует typed JSON schema с descriptions
+- Поддерживает вложенные объекты и массивы
+- Включает required fields
+
+**Шаблон переменных**:
+- `{{ input }}` - запрос пользователя
+- `{{ additional_context }}` (optional) - дополнительный контекст
+
+**Пример**:
+```
+Input: "Generate a data schema that extracts the title and link for the posts as a list"
+Context: {"url": "https://news.ycombinator.com", "data_extraction_goal": "Extract the title and link of the top 5 posts"}
+Output: {"posts": {"type": "array", "items": {"type": "object", "properties": {...}}}}
+```
+
+**Промпт**:
+```jinja2
+We are developing an interface for AI agent tasks that use JSON schemas to describe the shape of the data to that needs to extracted from a web page.
+
+You are given an input prompt from a user, and some additional context. Your goal is to generate a JSON schema given the user prompt and the context.
+
+If additional context is given, try to use it for further clues about the data that needs to be extracted.
+
+Example:
+User prompt: Generate a data schema that extracts the title and link for the posts as a list
+Additional context: 
+{"url": "https://news.ycombinator.com", "data_extraction_goal": "Extract the title and link of the top 5 posts"}
+
+Suggested Data Schema: 
+{
+  "posts": {
+    "type": "array",
+    "items": {
+      "type": "object",
+      "properties": {
+        "title": {"type": "string", "description": "Title of the post"},
+        "link": {"type": "string", "description": "Link to the post"}
+      },
+      "required": ["title", "link"]
+    }
+  }
+}
+
+Additional context: {{additional_context}}
+
+Respond only with JSON output containing a single key "output" with the value of the suggested data schema given:
+{{ input }}
+```
+
+---
+
+## 9. Form & Input Handling
+
+Промпты для точного взаимодействия с формами и input-элементами.
+
+---
+
+### 9.1. `single-input-action.j2`
+
+**Назначение**: Специализированный промпт для выполнения одного INPUT_TEXT действия. Более фокусированный подход к заполнению текстовых полей по сравнению с общим extract-action.
+
+**Используется в**:
+- `skyvern/core/script_generations/real_skyvern_page_ai.py:291`
+
+**Ключевые особенности**:
+- Только одно действие INPUT_TEXT
+- Детальный контекст для поля (required, search_bar, location_input, date_related)
+- Определение формата даты (date_format)
+- Проверка verification code
+
+**Возвращаемый контекст**:
+- `field` - название поля
+- `is_required` - обязательное поле или нет
+- `is_search_bar` - является ли поисковой строкой
+- `is_location_input` - запрашивает ли адрес/локацию
+- `is_date_related` - связано ли с датой
+- `date_format` - формат даты (YYYY-MM-DD, DD.MM.YYYY и т.д.)
+
+**Шаблон переменных**:
+- `{{ navigation_goal }}` - инструкция пользователя
+- `{{ navigation_payload_str }}` - данные пользователя
+- `{{ elements }}` - HTML элементы
+- `{{ current_url }}` - текущий URL
+- `{{ verification_code_check }}` - флаг проверки verification code
+
+**Промпт** (сокращенная версия):
+```jinja2
+Your are here to help the user to perform an INPUT_TEXT action on the web page.
+Each actionable element is tagged with an ID. Only take the action on the elements provided.
+MAKE SURE YOU OUTPUT VALID JSON.
+
+Reply in JSON format:
+{
+    "page_info": str,
+    "thoughts": str,
+    "actions": [{
+        "reasoning": str,
+        "user_detail_query": str,
+        "user_detail_answer": str,
+        "confidence_float": float,
+        "action_type": "INPUT_TEXT",
+        "id": str,
+        "text": str,
+        "context": {
+            "thought": str,
+            "field": str,
+            "is_required": bool,
+            "is_search_bar": bool,
+            "is_location_input": bool,
+            "is_date_related": bool,
+            "date_format": str
+        }
+    }]
+}
+
+User instruction: {{ navigation_goal }}
+User details: {{ navigation_payload_str }}
+HTML elements from {{ current_url }}: {{ elements }}
+```
+
+---
+
+### 9.2. `extraction_prompt_for_nat_language_loops.j2`
+
+**Назначение**: Извлекает значения для loop-итераций из естественного языка и содержимого страницы. Определяет, по каким элементам нужно итерировать (URLs, names, titles и т.д.).
+
+**Используется в**:
+- `skyvern/workflow/models/block.py:1233`
+
+**Примеры использования**:
+- "go to each product page" → извлекает URLs продуктов
+- "extract the authors of the top 4 posts" → извлекает имена авторов
+- "summarize the text of each article" → извлекает URLs статей
+- "download each file" → извлекает URLs файлов
+- "check if these articles are AI-related" → извлекает заголовки статей
+
+**Возвращает**: `loop_values` - массив строк для итерации
+
+**Шаблон переменных**:
+- `{{ natural_language_prompt }}` - запрос пользователя
+
+**Промпт**:
+```jinja2
+Analyze the current webpage and extract information based on this request: {{ natural_language_prompt }}
+
+You need to identify what values should be iterated over (loop_values). Each value should be the primary data that will be used in each loop iteration.
+
+For example:
+- If the request is "go to each product page", extract product URLs as strings
+- If the request is "extract the authors of the top 4 posts", extract author names as strings
+- If the request is "summarize the text of each article", extract article URLs as strings
+- If the request is "download each file", extract file URLs as strings
+- If the request is "check if these articles are AI-related", extract article titles as strings
+
+Return the results in the specified schema format with loop_values containing an array of strings.
+```
+
+---
+
