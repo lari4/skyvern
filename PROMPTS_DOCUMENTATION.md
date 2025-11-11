@@ -250,3 +250,125 @@ Current datetime, ISO format:
 
 ---
 
+## 2. Data Extraction
+
+Промпты для извлечения структурированной информации из веб-страниц.
+
+---
+
+### 2.1. `extract-information.j2`
+
+**Назначение**: Извлекает структурированные данные из веб-страницы согласно JSON-схеме. Основной промпт для data extraction - анализирует скриншот и DOM-элементы для получения нужной информации.
+
+**Используется в**:
+- `skyvern/webeye/actions/handler.py:3744`
+- Генерация скриптов
+- Workflow extraction blocks
+
+**Ключевые особенности**:
+- Строгое соответствие JSON-схеме выходных данных
+- Обработка null-значений для недоступных полей
+- Сохранение Jinja-стиля ссылок
+- Поддержка пользовательских кодов ошибок
+
+**Шаблон переменных**:
+- `{{ data_extraction_goal }}` - цель извлечения данных
+- `{{ extracted_information_schema }}` - JSON-схема для выходных данных
+- `{{ elements }}` - список элементов страницы
+- `{{ current_url }}` - текущий URL
+- `{{ extracted_text }}` - текст извлеченный из страницы
+- `{{ navigation_payload }}` - данные пользователя
+- `{{ previous_extracted_information }}` (опционально) - предыдущий контекст
+- `{{ error_code_mapping_str }}` (опционально) - коды ошибок
+
+**Промпт**:
+```jinja2
+You are given a screenshot, user data extraction goal, the JSON schema for the output data format, and the current URL.
+
+Your task is to extract the requested information from the screenshot and output it in the specified JSON schema format.
+
+Add as much details as possible to the output JSON object while conforming to the output JSON schema.
+
+Do not ever include anything other than the JSON object in your output, and do not ever include any additional fields in the JSON object.
+
+If you are unable to extract the requested information for a specific field in the json schema, please output a null value for that field.
+
+If you are trying to extract the href links which are using the jinja style like "{{}}", please keep the original string.
+
+User Data Extraction Goal: {{ data_extraction_goal }}
+
+Clickable elements from {{ current_url }}:
+{{ elements }}
+
+Current URL: {{ current_url }}
+
+Text extracted from the webpage: {{ extracted_text }}
+
+User Navigation Payload: {{ navigation_payload }}
+
+Current datetime, ISO format:
+{{ local_datetime }}
+```
+
+---
+
+## 3. UI-TARS & CUA Agent
+
+Промпты для GUI-агентов, использующих координатный подход к взаимодействию с UI.
+
+---
+
+### 3.1. `ui-tars-system-prompt.j2`
+
+**Назначение**: Системный промпт для UI-TARS агента - GUI-агент от ByteDance, использующий координатный подход (клики по x,y координатам). Адаптирован из открытого исходного кода UI-TARS.
+
+**Используется в**:
+- `skyvern/core/ui_tars_llm_caller.py:33`
+
+**Источник**: Адаптировано из https://github.com/bytedance/UI-TARS (Apache License 2.0)
+
+**Action Space (доступные действия)**:
+- `click(point='<point>x1 y1</point>')` - одиночный клик
+- `left_double(point='<point>x1 y1</point>')` - двойной клик
+- `right_single(point='<point>x1 y1</point>')` - правый клик
+- `drag(start_point='<point>x1 y1</point>', end_point='<point>x2 y2</point>')` - перетаскивание
+- `hotkey(key='ctrl c')` - горячие клавиши (до 3 клавиш)
+- `type(content='xxx')` - ввод текста (с escape-символами)
+- `scroll(point='<point>x1 y1</point>', direction='down/up/right/left')` - прокрутка
+- `wait()` - ожидание 5 секунд
+- `finished(content='xxx')` - завершение задачи
+
+**Шаблон переменных**:
+- `{{ language }}` - язык для вывода в секции Thought
+- `{{ instruction }}` - инструкция пользователя
+
+**Промпт**:
+```jinja2
+You are a GUI agent. You are given a task and your action history, with screenshots. You need to perform the next action to complete the task.
+
+## Output Format
+Thought: ...
+Action: ...
+
+## Action Space
+
+click(point='<point>x1 y1</point>')
+left_double(point='<point>x1 y1</point>')
+right_single(point='<point>x1 y1</point>')
+drag(start_point='<point>x1 y1</point>', end_point='<point>x2 y2</point>')
+hotkey(key='ctrl c')
+type(content='xxx')
+scroll(point='<point>x1 y1</point>', direction='down or up or right or left')
+wait()
+finished(content='xxx')
+
+## Note
+- Use {{language}} in Thought part.
+- Write a small plan and finally summarize your next action (with its target element) in one sentence in Thought part.
+
+## User Instruction
+{{instruction}}
+```
+
+---
+
