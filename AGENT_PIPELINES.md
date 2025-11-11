@@ -352,3 +352,490 @@ Step 3:
 
 ---
 
+
+## PIPELINE 2: Task V2 - Агентное планирование
+
+**Назначение**: Итеративное планирование задач с LLM-управляемым выбором стратегии на каждой итерации.
+
+**Entry Point**: `run_task_v2()` → `task_v2_service.py:356`
+
+**Когда используется**:
+- Сложные задачи, требующие динамического планирования
+- Задачи без четкой последовательности действий
+- API endpoint: `/api/v2/task_v2` 
+- Workflow blocks с Task V2
+
+### Ключевые отличия от Task V1
+
+| Аспект | Task V1 | Task V2 |
+|--------|---------|---------|
+| **Планирование** | Извлекает все действия сразу на шаг | LLM планирует по одной задаче за раз |
+| **Стратегия** | Фиксированная (action extraction) | Динамическая (navigate/extract/loop) |
+| **Итерации** | Max steps (обычно 10-20) | Max iterations (50) |
+| **Гибкость** | Низкая | Высокая - LLM решает стратегию |
+| **Use case** | Простые последовательные задачи | Сложные исследовательские задачи |
+
+### Архитектура Pipeline
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                      TASK V2 EXECUTION FLOW                               │
+└──────────────────────────────────────────────────────────────────────────┘
+
+1. INITIALIZATION (initialize_task_v2)
+   ├─> Create TaskV2 in database
+   ├─> Create auto-generated Workflow
+   ├─> Create WorkflowRun
+   └─> Call task_v2_generate_metadata prompt
+       ├─ Input: user_prompt, url
+       ├─ Output: { "title": str, "url": str }
+       └─ Update TaskV2 metadata
+
+2. MAIN PLANNING LOOP (max 50 iterations)
+   │
+   ┌──> Iteration N:
+   │   │
+   │   ├──> 3. SCRAPE PAGE
+   │   │    ├─> scrape_website(browser_state, current_url)
+   │   │    └─> Returns: ScrapedPage (elements, screenshots)
+   │   │
+   │   ├──> 4. PLANNING CALL (task_v2 prompt)
+   │   │    ├─> Load prompt: task_v2.j2
+   │   │    ├─> Variables:
+   │   │    │   - user_goal: task_v2.prompt
+   │   │    │   - current_url: current page URL
+   │   │    │   - elements: scraped_page.elements
+   │   │    │   - task_history: list of completed tasks
+   │   │    ├─> LLM Call → JSON response
+   │   │    └─> Parse:
+   │   │        {
+   │   │          "page_info": str,          // Observation
+   │   │          "extraction_thought": str, // Should extract?
+   │   │          "require_extraction": bool,
+   │   │          "thoughts": str,           // Reasoning
+   │   │          "user_goal_achieved": bool,// Done?
+   │   │          "plan": str,               // Next mini-goal
+   │   │          "task_type": str,          // navigate|extract|loop
+   │   │          "loop_values": list[str],  // For loop type
+   │   │        }
+   │   │
+   │   ├──> 5. DECISION POINT
+   │   │    ├─> IF user_goal_achieved == true:
+   │   │    │   ├─ Call _summarize_task_v2()
+   │   │    │   │  └─ Prompt: task_v2_summary.j2
+   │   │    │   └─ BREAK loop → Task completed
+   │   │    │
+   │   │    └─> ELSE: Generate and execute task block
+   │   │
+   │   ├──> 6. GENERATE TASK BLOCK (based on task_type)
+   │   │    │
+   │   │    ├─> IF task_type == "navigate":
+   │   │    │   ├─ Create NavigationBlock
+   │   │    │   ├─ navigation_goal = mini_goal template
+   │   │    │   └─ Calls Task V1 pipeline internally
+   │   │    │
+   │   │    ├─> IF task_type == "extract":
+   │   │    │   ├─ Call _generate_extraction_task()
+   │   │    │   ├─ Prompt: task_v2_generate_extraction_task.j2
+   │   │    │   │  └─ Generates JSON schema for extraction
+   │   │    │   ├─ Create ExtractionBlock
+   │   │    │   └─ Calls Data Extraction pipeline
+   │   │    │
+   │   │    └─> IF task_type == "loop":
+   │   │        ├─ Call _generate_loop_task()
+   │   │        ├─ Prompt: task_v2_loop_task_extraction_goal.j2
+   │   │        │  └─ Extracts loop values from page
+   │   │        ├─ Create ForLoopBlock
+   │   │        │  └─ Contains inner task blocks
+   │   │        └─ Execute loop iterations
+   │   │
+   │   ├──> 7. EXECUTE BLOCK
+   │   │    ├─> Call workflow_service.execute_block()
+   │   │    ├─> Block executes (may call Task V1 internally)
+   │   │    └─> Returns: BlockResult
+   │   │
+   │   ├──> 8. RECORD HISTORY
+   │   │    ├─> task_history.append({
+   │   │    │     "type": task_type,
+   │   │    │     "task": plan,
+   │   │    │     "status": block_result.status
+   │   │    │   })
+   │   │    └─> History used in next iteration
+   │   │
+   │   └──> 9. UPDATE WORKFLOW
+   │        ├─> Add block_yaml to workflow definition
+   │        ├─> Add parameters to workflow
+   │        └─> Update current_url from page
+   │
+   └──> LOOP BACK to step 3 (Iteration N+1)
+
+10. COMPLETION CHECK (after loop or break)
+    ├─> Call task_v2_check_completion.j2
+    ├─> Mark TaskV2 as completed/failed
+    └─> Cleanup browser (if needed)
+
+11. FAILURE HANDLING (if max iterations reached)
+    ├─> Call _summarize_max_steps_failure_reason()
+    ├─> Prompt: task_v2_summarize-max-steps-reason.j2
+    └─> Mark TaskV2 as failed
+```
+
+### Детальный flow по методам
+
+#### 1. `initialize_task_v2()` - Task creation
+```
+Input:
+  - user_prompt: str
+  - user_url: str | None
+  - organization: Organization
+  - extracted_information_schema: dict | None
+
+Flow:
+  1. Create TaskV2 in database
+  2. Create auto-generated Workflow
+  3. Create WorkflowRun (status=queued)
+  4. Link TaskV2 ↔ WorkflowRun
+  5. Set context (task_v2_id, workflow_run_id)
+
+Output:
+  - task_v2: TaskV2
+```
+
+#### 2. `initialize_task_v2_metadata()` - Generate metadata
+```
+Input:
+  - task_v2: TaskV2
+  - user_prompt: str
+  - current_browser_url: str | None
+  - user_url: str | None
+
+Flow:
+  1. Scrape current page (if exists)
+
+  2. Build prompt: task_v2_generate_metadata.j2
+     Variables:
+       - {{ user_prompt }}
+       - {{ current_browser_url }}
+       - {{ user_url }}
+
+  3. LLM Call → { "title": str, "url": str }
+
+  4. Update TaskV2:
+     - task_v2.title = response["title"]
+     - task_v2.url = response["url"]
+
+Output:
+  - task_v2: TaskV2 (with title and url)
+```
+
+#### 3. `run_task_v2_helper()` - Main execution loop
+```
+Input:
+  - task_v2: TaskV2
+  - organization: Organization
+
+Flow:
+  1. Get or create browser_state
+  2. Initialize variables:
+     - task_history = []
+     - yaml_blocks = []
+     - current_url = page.url
+
+  3. FOR i in range(DEFAULT_MAX_ITERATIONS=50):
+     
+     a) Validate task (check cancel/timeout)
+     
+     b) IF i == 0 (first iteration):
+        - Navigate to task_v2.url
+        - Create goto_url block
+     
+     ELSE:
+        c) Scrape current page
+        
+        d) Call task_v2 planning prompt
+           prompt = load_prompt_with_elements(
+             scraped_page,
+             "task_v2",
+             user_goal=task_v2.prompt,
+             task_history=task_history
+           )
+           
+        e) LLM Call → task_v2_response
+        
+        f) Parse response:
+           - user_goal_achieved
+           - task_type (navigate/extract/loop)
+           - plan (mini-goal)
+        
+        g) IF user_goal_achieved:
+           - Call _summarize_task_v2()
+           - BREAK loop
+        
+        h) Generate block based on task_type:
+           - navigate → NavigationBlock
+           - extract → ExtractionBlock  
+           - loop → ForLoopBlock
+        
+        i) Execute block via workflow_service
+        
+        j) Record to task_history
+        
+        k) Update current_url from page
+
+  4. IF loop completed without break:
+     - Reached max iterations
+     - Call _summarize_max_steps_failure_reason()
+     - Mark task as failed
+
+  5. Cleanup & webhooks
+
+Output:
+  - task_v2: TaskV2 (completed/failed)
+  - workflow: Workflow (with generated blocks)
+  - workflow_run: WorkflowRun
+```
+
+### Промпты и их последовательность
+
+#### Инициализация:
+
+**1. Generate Metadata** (`task_v2_generate_metadata.j2`)
+```
+Input:
+  - {{ user_prompt }}
+  - {{ current_browser_url }}
+  - {{ user_url }}
+
+Output:
+{
+  "title": str,  // Task title
+  "url": str     // Resolved starting URL
+}
+
+Вызывается: 1 раз при создании Task V2
+```
+
+#### Основной цикл (каждая итерация):
+
+**2. Planning** (`task_v2.j2`) - ❗ КЛЮЧЕВОЙ ПРОМПТ
+```
+Input:
+  - {{ user_goal }}      // Исходная цель пользователя
+  - {{ current_url }}    // Текущий URL страницы
+  - {{ elements }}       // DOM элементы
+  - {{ task_history }}   // История выполненных задач
+  - {{ local_datetime }} // Текущее время
+
+Output:
+{
+  "page_info": str,                  // Описание страницы
+  "extraction_thought": str,         // Нужно ли извлекать данные?
+  "require_extraction": bool,
+  "task_history_information": str,   // Что уже сделано
+  "information_extracted": bool|null,
+  "thoughts": str,                   // Рассуждения (step-by-step)
+  "user_goal_achieved": bool,        // Цель достигнута?
+  "plan": str,                       // Следующая мини-цель
+  "task_type": "navigate"|"extract"|"loop",
+  "loop_values": list[str]|null,     // Для loop типа
+  "is_loop_value_link": bool         // URL ли значения loop
+}
+
+Вызывается: Каждую итерацию (до 50 раз)
+```
+
+#### Генерация задач (по типу):
+
+**3a. Generate Extraction Task** (`task_v2_generate_extraction_task.j2`)
+```
+Input:
+  - {{ data_extraction_goal }}
+  - {{ extracted_information_schema }} (если задана)
+  - {{ elements }}
+  - {{ task_history }}
+
+Output:
+{
+  "thought": str,
+  "suggested_data_schema": {...}  // JSON schema для extraction
+}
+
+Вызывается: Когда task_type == "extract"
+```
+
+**3b. Loop Task Extraction Goal** (`task_v2_loop_task_extraction_goal.j2`)
+```
+Input:
+  - {{ natural_language_prompt }}  // План для loop
+  - {{ elements }}
+  - Generated schema с loop_values
+
+Output:
+{
+  "loop_values": [str, str, ...],     // Список значений для итерации
+  "is_loop_value_link": bool
+}
+
+Вызывается: Когда task_type == "loop"
+```
+
+#### Завершение:
+
+**4. Task V2 Summary** (`task_v2_summary.j2`)
+```
+Input:
+  - {{ user_goal }}
+  - {{ task_history }}
+  - {{ current_url }}
+  - Screenshots
+
+Output:
+{
+  "summary": str,  // Итоговое резюме выполнения
+  "status": str    // Success/Partial/Failed
+}
+
+Вызывается: При user_goal_achieved=true
+```
+
+**5. Check Completion** (`task_v2_check_completion.j2`)
+```
+Input:
+  - {{ user_goal }}
+  - {{ current_url }}
+  - {{ elements }}
+  - {{ task_history }}
+
+Output:
+{
+  "reasoning": str,
+  "user_goal_achieved": bool
+}
+
+Вызывается: Для финальной проверки
+```
+
+**6. Summarize Max Steps Reason** (`task_v2_summarize-max-steps-reason.j2`)
+```
+Input:
+  - {{ navigation_goal }}
+  - {{ history }}  // Block history
+  - {{ block_cnt }}
+
+Output:
+{
+  "page_info": str,
+  "reasoning": str  // Почему не достигли цели
+}
+
+Вызывается: При достижении max iterations
+```
+
+### Передача данных между итерациями
+
+```
+Iteration 1:
+  Scrape → task_v2 prompt → "navigate to login"
+  Execute → NavigationBlock
+  Result → {type: "navigate", task: "login", status: "completed"}
+  └─> Added to task_history
+
+Iteration 2:
+  task_history = [iteration 1 result]
+  Scrape → task_v2 prompt (with history) → "extract user info"
+  Execute → ExtractionBlock
+  Result → {type: "extract", task: "get user data", status: "completed"}
+  └─> Added to task_history
+
+Iteration 3:
+  task_history = [iteration 1, iteration 2]
+  Scrape → task_v2 prompt (with history) → user_goal_achieved=true
+  └─> Summarize and complete
+```
+
+### Mini-Goal Template
+
+Когда LLM возвращает task_type="navigate", создается NavigationBlock с навигационной целью:
+
+```python
+MINI_GOAL_TEMPLATE = """Achieve the following mini goal and once it's achieved, complete:
+```{mini_goal}```
+
+This mini goal is part of the big goal the user wants to achieve and use the big goal as context to achieve the mini goal:
+```{main_goal}```"""
+```
+
+Это помогает Task V1 (внутри NavigationBlock) понять контекст и остановиться после достижения мини-цели.
+
+### Exit условия
+
+1. **Success - user_goal_achieved=true**
+   - LLM определяет, что цель достигнута
+   - task_v2_response["user_goal_achieved"] == true
+   - Call _summarize_task_v2()
+   - TaskV2 status → COMPLETED
+
+2. **Failure - Max Iterations**
+   - i >= DEFAULT_MAX_ITERATIONS (50)
+   - Call _summarize_max_steps_failure_reason()
+   - TaskV2 status → FAILED
+
+3. **Failure - Workflow Canceled**
+   - workflow_run.status == CANCELED
+   - TaskV2 status → CANCELED
+
+4. **Failure - Exception**
+   - Browser crash, LLM error, etc.
+   - TaskV2 status → FAILED
+
+### Пример выполнения
+
+```
+Task V2: "Find the top 5 posts on Hacker News and extract their titles and links"
+
+Iteration 1:
+  Planning → "Go to Hacker News homepage"
+  Type → navigate
+  Execute → NavigationBlock (goes to news.ycombinator.com)
+  Result → Success
+
+Iteration 2:
+  Planning → "Extract the list of top posts with their titles and links"
+  Type → loop
+  Sub-prompts:
+    - task_v2_loop_task_extraction_goal → Extracts 5 post links
+    - task_v2_generate_extraction_task → Creates schema for title+link
+  Execute → ForLoopBlock
+    - Inner ExtractionBlock for each link
+  Result → Extracted 5 posts
+
+Iteration 3:
+  Planning → user_goal_achieved=true (all data extracted)
+  Summarize → "Successfully extracted 5 posts from HN"
+  Result → COMPLETED
+```
+
+### Особенности реализации
+
+1. **Workflow Auto-generation**
+   - Task V2 динамически создает Workflow
+   - Каждая итерация добавляет блоки в YAML
+   - Финальный workflow можно переиспользовать
+
+2. **Block Nesting**
+   - NavigationBlock вызывает Task V1 pipeline
+   - ExtractionBlock вызывает Data Extraction pipeline
+   - ForLoopBlock рекурсивно выполняет inner blocks
+
+3. **Context Awareness**
+   - task_history хранит всю историю
+   - LLM видит, что уже сделано
+   - Избегает повторяющихся действий
+
+4. **Flexibility**
+   - LLM сам выбирает стратегию
+   - Может переключаться navigate ↔ extract
+   - Адаптируется к изменениям на странице
+
+---
+
