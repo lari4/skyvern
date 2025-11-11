@@ -372,3 +372,226 @@ finished(content='xxx')
 
 ---
 
+## 4. Validation & Verification
+
+Промпты для проверки достижения целей и валидации данных.
+
+---
+
+### 4.1. `check-user-goal.j2`
+
+**Назначение**: Определяет, достигнута ли цель пользователя на текущей странице. Анализирует элементы страницы, скриншот и историю действий для принятия решения о завершении задачи.
+
+**Используется в**:
+- `skyvern/forge/agent.py:1845`
+
+**Ключевые особенности**:
+- Пошаговое рассуждение (think step by step)
+- Поддержка custom complete criterion
+- Анализ истории действий
+- Обработка новых элементов (emerging elements)
+
+**Шаблон переменных**:
+- `{{ navigation_goal }}` - цель пользователя
+- `{{ navigation_payload }}` - данные пользователя
+- `{{ elements }}` - элементы на странице
+- `{{ complete_criterion }}` (опционально) - критерий завершения
+- `{{ action_history }}` (опционально) - история действий
+- `{{ new_elements_ids }}` (опционально) - ID новых элементов
+- `{{ without_screenshots }}` - флаг работы без скриншотов
+
+**Промпт**:
+```jinja2
+Your are here to help the user determine if the user has completed their goal on the web. Use the content of the elements parsed from the page, the screenshots of the page, the user goal and user details to determine whether the user goal has been completed or not.
+
+Make sure to ONLY return the JSON object in this format with no additional text before or after it:
+{
+  "page_info": str, // Think step by step. Describe all the useful information in the page related to the user goal.
+  "thoughts": str, // Think step by step. What information makes you believe whether user goal has completed or not. Use information you see on the site to explain.
+  "user_goal_achieved": bool // True if the user goal has been completed, false otherwise.
+}
+
+User Goal:
+{{ navigation_goal }}
+
+User Details:
+{{ navigation_payload }}
+
+Elements on the page:
+{{ elements }}
+
+Current datetime, ISO format:
+{{ local_datetime }}
+```
+
+---
+
+## 5. Visual Element Parsing
+
+Промпты для интерпретации визуальных элементов (SVG, CSS shapes) в текстовые описания.
+
+---
+
+### 5.1. `svg-convert.j2`
+
+**Назначение**: Конвертирует SVG-элементы в текстовые описания их формы и значения. Помогает LLM понимать визуальные иконки и символы, представленные в SVG-формате.
+
+**Используется в**:
+- `skyvern/webeye/scraper/agent_functions.py:223`
+
+**Ключевые особенности**:
+- Определение уверенности (confidence) в распознавании
+- Флаг распознанности (recognized)
+- Краткое описание формы и ее значения
+
+**Шаблон переменных**:
+- `{{ svg_element }}` - SVG код элемента
+
+**Промпт**:
+```jinja2
+You are given a svg element. You need to figure out what its shape means.
+SVG Element:
+{{svg_element}}
+
+MAKE SURE YOU OUTPUT VALID JSON. No text before or after JSON, no trailing commas, no comments (//), no unnecessary quotes, etc.
+Reply in JSON format with the following keys:
+{
+    "confidence_float": float, // The confidence of the action. Pick a number between 0.0 and 1.0. 0.0 means no confidence, 1.0 means full confidence
+    "shape": string, // Concise keywords describing the shape of SVG and its meaning
+    "recognized": bool, // False if you can't recognize the shape or you don't understand the meaning, otherwise true.
+}
+```
+
+---
+
+## 6. Authentication & Verification
+
+Промпты для обработки аутентификации и верификации (OTP, magic links).
+
+---
+
+### 6.1. `parse-otp-login.j2`
+
+**Назначение**: Парсит OTP (One-Time Password) из email или SMS сообщений. Определяет тип OTP (TOTP код или Magic Link) и извлекает значение для автоматической верификации входа.
+
+**Используется в**:
+- `skyvern/services/otp_service.py:40`
+
+**Типы OTP**:
+- `magic_link` - ссылка для верификации (HTTP/HTTPS URL)
+- `totp` - временный код (обычно цифры, иногда с буквами)
+
+**Шаблон переменных**:
+- `{{ content }}` - содержимое email/SMS с OTP
+
+**Промпт**:
+```jinja2
+You receive either an email or a text message containing an OTP(like TOTP, Magic Link) to verify the login. Your job is to parse the content, identify the OTP type and value. There should be only one OTP type and one OTP value in the content. The value must be from the content
+
+You should follow the rules below to identify the OTP type and value:
+- If it's a Magic Link login, the value is usually a link which must be a valid HTTP or HTTPS URL.
+- If it's a TOTP login, The most common value is a code which is a series of digits, although sometimes it may contain letters.
+
+MAKE SURE YOU OUTPUT VALID JSON. No text before or after JSON, no trailing commas, no comments (//), no unnecessary quotes, etc.
+
+Reply in the following JSON format:
+{
+    "reasoning": str, // How you figure out what the OTP type and value is or why the OTP type and value is missing. Be precise here to explain the data source and the context that makes you believe where the correct OTP type and value is
+    "otp_type": str, // the type of OTP. It can be "magic_link" or "totp"
+    "otp_value_found": bool, // true if the OTP value is found. false if the OTP value is not found
+    "otp_value": str, // the OTP value. If you cannot identify any OTP value, do not come up with a OTP value and return null
+}
+
+Received Content containing OTP:
+{{ content }}
+```
+
+---
+
+## 7. Workflow Generation
+
+Промпты для генерации workflow из текстовых описаний процедур.
+
+---
+
+### 7.1. `build-workflow-from-pdf.j2`
+
+**Назначение**: Конвертирует Standard Operating Procedures (SOP) из текста в JSON-определение Skyvern workflow. Мощный промпт для автоматического создания рабочих процессов из документации.
+
+**Используется в**:
+- `skyvern/services/pdf_import_service.py:172`
+
+**Доступные типы блоков**:
+- `login` - аутентификация с credentials
+- `navigation` - навигация и заполнение форм
+- `action` - клики и простые действия
+- `extraction` - извлечение данных
+- `task` - сложные задачи (navigation + extraction)
+- `file_download` - скачивание файлов
+- `for_loop` - циклы по списку
+- `validation` - валидация данных
+- `wait` - ожидание/пауза
+- `code` - выполнение кастомного кода
+- `text_prompt` - генерация текста через LLM
+- `http_request` - API вызовы
+
+**Типы параметров workflow**:
+- `string` - строковые значения
+- `json` - JSON объекты
+- `credential_id` - пароли/credentials
+- `file_url` - URL файлов
+
+**Ключевые требования**:
+- Один блок = одно действие
+- Сохранение порядка шагов из SOP
+- Детальный navigation_goal с точными инструкциями
+- engine = "skyvern-1.0" для всех блоков
+- Полная конвертация ВСЕХ автоматизируемых шагов
+
+**Шаблон переменных**:
+- `{{ sop_text }}` - текст Standard Operating Procedure
+
+**Промпт** (сокращенная версия, см. файл для полной):
+```jinja2
+You are an AI assistant that converts Standard Operating Procedures (SOP) from text into a Skyvern workflow definition in JSON format.
+
+REQUIRED OUTPUT FORMAT:
+{
+  "title": "workflow_name",
+  "workflow_definition": {
+    "parameters": [...],
+    "blocks": [...]
+  }
+}
+
+AVAILABLE BLOCK TYPES:
+- "login": For user authentication with credentials
+- "navigation": For navigating to pages and filling forms
+- "action": For clicking buttons or simple actions
+- "extraction": For extracting data from pages
+- "task": For complex tasks with both navigation and extraction
+- "file_download": For downloading files
+- "for_loop": For repeating actions over a list
+- "validation": For validating extracted data
+- "wait": For waiting/pausing
+- "code": For custom code execution
+- "text_prompt": For LLM text generation
+- "http_request": For API calls
+
+CRITICAL INSTRUCTIONS:
+1. BE THOROUGH: Convert EVERY automatable step from the SOP into a block
+2. PRESERVE SPECIFICITY: Keep exact instructions from SOP
+3. ONE ACTION PER BLOCK: Each block does ONE specific thing
+4. DETAILED navigation_goal: Copy exact instructions from SOP
+5. MAINTAIN ORDER: Keep exact order of steps from SOP
+6. INCLUDE ALL CONDITIONS: Create conditional blocks if needed
+7. Set engine to "skyvern-1.0" for all blocks that need it
+
+Standard Operating Procedure:
+{{ sop_text }}
+
+Return ONLY a valid JSON object.
+```
+
+---
+
